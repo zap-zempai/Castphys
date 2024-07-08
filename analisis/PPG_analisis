@@ -1,0 +1,264 @@
+## Correu
+## ----- imports -----
+from typing import no_type_check
+import numpy as np
+from scipy.signal import filtfilt, butter
+from scipy.interpolate import Akima1DInterpolator
+from scipy.sparse import spdiags
+#from evaluation.utils import *
+from scipy.signal import hilbert, periodogram
+
+
+
+
+## ----- function -----
+def compute_power_spectrum(signal, Fs, zero_pad=None):
+    if zero_pad is not None:
+        L = len(signal)
+        signal = np.pad(signal, (int(zero_pad / 2 * L), int(zero_pad / 2 * L)), 'constant')
+    freqs = np.fft.fftfreq(len(signal), 1 / Fs) * 60  # in bpm
+    ps = np.abs(np.fft.fft(signal)) ** 2
+    cutoff = len(freqs) // 2
+    freqs = freqs[:cutoff]
+    ps = ps[:cutoff]
+    return freqs, ps
+
+
+def detrend(signal, Lambda):
+    """detrend(signal, Lambda) -> filtered_signal
+    This function applies a detrending filter.
+    This code is based on the following article "An advanced detrending method with application
+    to HRV analysis". Tarvainen et al., IEEE Trans on Biomedical Engineering, 2002.
+    *Parameters*
+      ``signal`` (1d numpy array):
+        The signal where you want to remove the trend.
+      ``Lambda`` (int):
+        The smoothing parameter.
+    *Returns*
+      ``filtered_signal`` (1d numpy array):
+        The detrended signal.
+    """
+    signal_length = signal.shape[0]
+    # observation matrix
+    H = np.identity(signal_length)
+    # second-order difference matrix
+    ones = np.ones(signal_length)
+    minus_twos = -2 * np.ones(signal_length)
+    diags_data = np.array([ones, minus_twos, ones])
+    diags_index = np.array([0, 1, 2])
+    D = spdiags(diags_data, diags_index, (signal_length - 2), signal_length).toarray()
+    filtered_signal = np.dot((H - np.linalg.inv(H + (Lambda ** 2) * np.dot(D.T, D))), signal)
+
+    return filtered_signal
+
+
+def _next_power_of_2(x):
+    """Calculate the nearest power of 2."""
+    return 1 if x == 0 else 2 ** (x - 1).bit_length()
+
+
+def _calculate_fft_hr(ppg_signal, fs=30, low_pass=0.75, high_pass=2.5):
+    """Calculate heart rate based on PPG using Fast Fourier transform (FFT)."""
+    ppg_signal = np.expand_dims(ppg_signal, 0)
+    N = _next_power_of_2(ppg_signal.shape[1])
+    f_ppg, pxx_ppg = periodogram(ppg_signal, fs=fs, nfft=N, detrend=False)
+    fmask_ppg = np.argwhere((f_ppg >= low_pass) & (f_ppg <= high_pass))
+    mask_ppg = np.take(f_ppg, fmask_ppg)
+    mask_pxx = np.take(pxx_ppg, fmask_ppg)
+    fft_hr = np.take(mask_ppg, np.argmax(mask_pxx, 0))[0] * 60
+    return fft_hr, pxx_ppg, f_ppg
+
+
+def predict_heart_rate(signal, Fs, min_hr=40., max_hr=180., method='FFT', post_preprocessing=False):
+    if post_preprocessing:
+        # [b, a] = butter(1, [0.5 / Fs * 2, 3 / Fs * 2], btype='bandpass')
+        # signal = filtfilt(b, a, np.double(signal))
+        # signal = detrend(signal, 100)
+        [b, a] = butter(1, [0.5 / Fs * 2, 3.3 / Fs * 2], btype='bandpass')
+        signal = filtfilt(b, a, np.double(signal))
+        signal = detrend(signal, 100)
+    if method == 'FFT':
+        return _calculate_fft_hr(signal, fs=Fs, low_pass=0.75, high_pass=2.5)
+
+    elif method == 'fast_ideal':
+        """ Zero-pad in time domain for ideal interp in freq domain
+        """
+        signal = signal - np.mean(signal)
+        freqs, ps = compute_power_spectrum(signal, Fs, zero_pad=100)
+        freqs_valid = np.logical_and(freqs >= min_hr, freqs <= max_hr)
+        freqs = freqs[freqs_valid]
+        ps = ps[freqs_valid]
+        max_ind = np.argmax(ps)
+        if 0 < max_ind < len(ps) - 1:
+            inds = [-1, 0, 1] + max_ind
+            x = ps[inds]
+            f = freqs[inds]
+            d1 = x[1] - x[0]
+            d2 = x[1] - x[2]
+            offset = (1 - min(d1, d2) / max(d1, d2)) * (f[1] - f[0])
+            if d2 > d1:
+                offset *= -1
+            max_bpm = f[1] + offset
+        elif max_ind == 0:
+            x0, x1 = ps[0], ps[1]
+            f0, f1 = freqs[0], freqs[1]
+            max_bpm = f0 + (x1 / (x0 + x1)) * (f1 - f0)
+        elif max_ind == len(ps) - 1:
+            x0, x1 = ps[-2], ps[-1]
+            f0, f1 = freqs[-2], freqs[-1]
+            max_bpm = f0 + (x1 / (x0 + x1)) * (f1 - f0)
+
+        ppg_signal = np.expand_dims(signal, 0)
+        N = _next_power_of_2(ppg_signal.shape[1])
+        f_ppg, pxx_ppg = periodogram(ppg_signal, fs=Fs, nfft=N, detrend=False)
+        return max_bpm, pxx_ppg, f_ppg
+
+
+# ----- Import -----
+import matplotlib
+from matplotlib import pyplot as plt
+from pathlib import Path
+import pandas as pd
+from glob import glob
+from tqdm import tqdm
+
+matplotlib.use('TkAgg')
+
+# ----- function -----
+def search_pics(pxx_ppg, N=3, pad=5):
+    id_all_sort_points = [list(pxx_ppg[0]).index(e) for e in sorted(pxx_ppg[0], reverse=True)]
+    id_max_points = []
+    for id in id_all_sort_points:
+        has_edit = False
+        for i, [id_max, [id_d, id_u]] in enumerate(id_max_points):
+            if id > id_max and id <= id_u+pad:
+                id_max_points[i][1][1] = max(id, id_u)
+                has_edit = True
+            elif id < id_max and id >= id_d-pad:
+                id_max_points[i][1][0] = min(id, id_d)
+                has_edit = True
+        if not has_edit:
+            id_max_points.append([id,[id,id]])
+            if len(id_max_points) >= N:
+                break
+    return id_max_points
+
+
+def clr_y_select(name):
+    try:
+        c,i = name.split('_')
+        i = (int(i)-1.5)*2
+    except:
+        return "grey",10
+    if c == 'Q1':
+        return "yellow",-4+i*0.2
+    elif c == 'Q2':
+        return "lime",-3+i*0.2
+    elif c == 'Q3':
+        return "blue",-2+i*0.2
+    elif c == 'Q4':
+        return "red",-1+i*0.2
+    elif c == 'Q5':
+        return "orange",0+i*0.2
+    elif c == 'Q6':
+        return "cyan",1+i*0.2
+    elif c == 'Q7':
+        return "blueviolet",2+i*0.2
+    elif c == 'Q8':
+        return "magenta",3+i*0.2
+    elif c == 'Q9':
+        return "greenyellow",4+i*0.2
+    else:
+        return "grey",10+i*0.2
+   
+
+
+## Path
+castphys_folder = Path("D:/castphys_60/Data")
+save_path = Path("C:/Users/Alex/Desktop/video_saves")
+ids = [int(x.split('_')[1]) for x in glob("Patient_*", root_dir=castphys_folder)]
+#ids = [id for id in ids if id != 5]
+list_videos = glob("Q*", root_dir=str(castphys_folder / f"Patient_{ids[0]}"))
+#list_videos = ['Q1_1','Q9_2']
+mean_bpm = []
+all_bpm = []
+bins = range(40,120,5)
+
+## obtain PPG signal
+for v_name in list_videos:
+    max_bpm_list = []
+    for id in tqdm(ids):
+        video_folder = castphys_folder / f"Patient_{id}" / v_name
+
+        df_bio = pd.read_csv(video_folder / 'bio.csv')
+        signal_PPG = df_bio['ppg'].values
+        signal_PPG = (signal_PPG-signal_PPG.min())/(signal_PPG.max()-signal_PPG.min())*2-1
+        max_bpm, pxx_ppg, f_ppg = predict_heart_rate(signal_PPG, 60, min_hr=40., max_hr=180., method='FFT', post_preprocessing=True)
+        #id_max_points = search_pics(pxx_ppg, N=N)
+
+        max_bpm_list.append(max_bpm)
+        all_bpm.append(max_bpm)
+    mean_bpm.append(np.mean(max_bpm_list))
+
+    if False:
+        ## plot
+        fig, ax = plt.subplots()
+        ax.hist(max_bpm_list, bins = bins, edgecolor = "white")
+        ax.plot([np.mean(max_bpm_list)]*2,[0,20], color="red")
+        plt.text(np.mean(max_bpm_list)+1,14.3,'mitjana')
+        ax.set_xlim([40,120])
+        ax.set_ylim([0,15])
+        ax.set_title(f"Video {v_name}")
+        ax.set_xlabel('bpm')
+        plt.savefig(save_path / "bpm_hist" / f"bpm_{v_name}.png")
+        #plt.show()
+
+    
+        
+
+
+if False:
+    fig, ax = plt.subplots()
+    ax.plot([40,120],[0,0], color="grey",alpha=0.5,linestyle='--')
+    for i,v_name in enumerate(list_videos):
+        clr,_ = clr_y_select(v_name)
+        ax.scatter(x=np.mean(mean_bpm[i]),y=0, color=clr,label=v_name)
+        plt.text(np.mean(mean_bpm[i]),0.05,v_name, rotation = 60)
+    ax.set_xlim([72.5,77])
+    ax.set_ylim([-1,1])
+    ax.set_yticks([])
+    ax.set_title("bmp maxim mitja")
+    ax.set_xlabel('bpm')
+    plt.savefig(save_path / "bpm_mean_hist.png")
+    plt.show()
+
+
+fig, ax = plt.subplots()
+legend_add = []
+for i,v_name in enumerate(list_videos):
+    clr,y = clr_y_select(v_name)
+    if clr not in legend_add:
+        ax.bar(x=v_name, height=np.mean(mean_bpm[i]),color=clr,label=v_name.split('_')[0])
+        legend_add.append(clr)
+    else:
+        ax.bar(x=v_name, height=np.mean(mean_bpm[i]),color=clr)
+ax.set_ylim([70,80])
+#ax.set_title(f"bmp maxim mitja")
+ax.set_ylabel('BPM')
+plt.legend(bbox_to_anchor = (1.01, 1))
+ax.set_xticks([])
+ax.set_xlabel('Vídeos')
+plt.savefig(save_path / "bpm_mean_bar.png")
+plt.show()
+
+
+fig, ax = plt.subplots()
+ax.hist(all_bpm, bins = bins, edgecolor = "white")
+ax.set_xlim([40,120])
+ax.set_xlabel('BPM')
+ax.set_ylabel('Counts')
+plt.savefig(save_path / "bpm_max_hist.png")
+plt.show()
+
+print('Mean:', np.mean(all_bpm), '| std:', np.std(all_bpm))
+
